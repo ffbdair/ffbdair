@@ -1,0 +1,35 @@
+---
+title: "Stats 100: Final Project"
+author: "Faris Bdair"
+date: "03/14/2024"
+header-includes:
+   - \usepackage{bbm, amsmath,amsfonts,amsthm,amssymb,mathrsfs,amsxtra,amscd,latexsym, xcolor, graphicx, fvextra}
+   - \DefineVerbatimEnvironment{Highlighting}{Verbatim}{breaklines,commandchars=\\\{\}}
+output: pdf_document
+---
+# Fifa World Cup Project Motivation
+
+# Acknowledgements
+This data was manually gathered by looking at Wikipedia pages of all 22 World Cups and tracking the confederations of every team in the Final and the 3rd Place Match.
+
+```{r}
+suppressPackageStartupMessages(library(knitr)) #makes pdfs
+suppressPackageStartupMessages(library(latex2exp))
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(nnet))
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+Historical_WC_Final_Fours = read.csv('WC_Final_Four.csv')
+```
+
+```{r}
+data_long <- tidyr::pivot_longer(Historical_WC_Final_Fours, cols = c(Champions, Finalists, Semi.Finalists),
+                                 names_to = "Category", values_to = "Count")
+ggplot(data_long, aes(x = reorder(Confederation, Count, sum), y = Count, fill = Category)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(x = "Confederation", y = "Count", title = "Historical World Cup Final Fours by Confederation") +
+  scale_fill_brewer(palette = "Pastel1")
+```

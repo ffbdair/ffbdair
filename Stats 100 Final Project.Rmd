@@ -1,0 +1,731 @@
+---
+title: "Stats 100: Final Project"
+author: "Faris Bdair"
+date: "03/14/2024"
+header-includes:
+   - \usepackage{bbm, amsmath,amsfonts,amsthm,amssymb,mathrsfs,amsxtra,amscd,latexsym, xcolor, graphicx, fvextra}
+   - \DefineVerbatimEnvironment{Highlighting}{Verbatim}{breaklines,commandchars=\\\{\}}
+output: pdf_document
+---
+# Predicting Fifa World Cup
+
+# Acknowledgements
+
+```{r}
+## Load in necessary libraries
+suppressPackageStartupMessages(library(knitr)) #makes pdfs
+suppressPackageStartupMessages(library(latex2exp))
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(nnet))
+suppressPackageStartupMessages(library(lmtest))
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+## Load in files from source
+
+# All international soccer games ever
+games = read.csv('Fifa_Results_All.csv')
+
+# A list of fifa rankings since 12-31-1992
+rankings = read.csv('FIFA_Rankings.csv')
+
+# A dataset of the 2022 world cup with teams, groups, confederations, ELOs and results
+Test_WC_2022_dataset = read.csv('2022_World_Cup.csv')
+
+# Create a dataset of only World Cup and World Cup Qualifiers
+WC_all_time = filter(games,
+                     tournament == 'FIFA World Cup qualification'  |
+                       tournament == 'FIFA World Cup')
+
+# Create a dataset of only games between 2003 and 2022 (2006 Qualifiers -> 2022 Qualifiers)
+WC_dataset = filter(WC_all_time, date >= 2003 & date <= 2022)
+```
+
+
+```{r}
+## Creates a new dataframe with all the data we want in the same place
+
+# Since our rankings dataframe has repeats, we need to select the most common confederation associated with a country and assign that confederation to the country
+country_confederation = rankings %>%
+  group_by(country_full, confederation) %>%
+  summarise(count = n(), .groups = 'drop') %>%
+  arrange(desc(count)) %>%
+  group_by(country_full) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(-count)
+
+# This creates a dataframe sorted by country again removing repeats and separating ranking dates into seperate columns
+Elo_rankings = rankings %>%
+  select(country_full, rank_date, total_points) %>%
+  pivot_wider(names_from = rank_date, values_from = total_points)
+
+# Merge the two data frames to get with with team, confederation, and all its rankings ever
+Country_Data <-
+  left_join(country_confederation, Elo_rankings, by = "country_full")
+```
+
+```{r}
+## Using our new Country_Data dataframe to add confederations to our WC_dataset
+
+# Adding home_confederation and away_confederation columns to our dataset
+WC_dataset$home_confederation = NA
+WC_dataset$away_confederation = NA
+
+# Update home_confederation based on Country_Data
+WC_dataset <- WC_dataset %>%
+  left_join(
+    Country_Data %>% select(country_full, confederation),
+    by = c("home_team" = "country_full")
+  ) %>%
+  mutate(home_confederation = coalesce(confederation, home_confederation)) %>%
+  select(-confederation)
+
+# Update away_confederation based on Country_Data
+WC_dataset <- WC_dataset %>%
+  left_join(
+    Country_Data %>% select(country_full, confederation),
+    by = c("away_team" = "country_full")
+  ) %>%
+  mutate(away_confederation = coalesce(confederation, away_confederation)) %>%
+  select(-confederation)
+```
+
+```{r}
+## Use Country_Data to find the date of the most recent rankings for a team before the game in question
+
+# Convert the date column names (excluding country_full and confederation) in Country_Data to Date objects
+date_columns <- names(Country_Data)[-c(1, 2)]
+date_columns_dates <-
+  as.Date(date_columns, format = "%Y-%m-%d") # Adjust format as necessary
+
+# Function to find the latest ranking date column name before a given date
+find_latest_date_column_before <- function(game_date) {
+  game_date <- as.Date(game_date)
+  valid_dates <-
+    date_columns_dates[which(date_columns_dates < game_date)]
+  if (length(valid_dates) == 0)
+    return(NA) # Return NA if no earlier date is found
+  latest_date <- max(valid_dates)
+  column_name <-
+    date_columns[which(date_columns_dates == latest_date)]
+  return(column_name)
+}
+
+# Apply this function for each row in WC_dataset to find the relevant ranking dates
+WC_dataset <- WC_dataset %>%
+  mutate(latest_ranking_date = map_chr(date, find_latest_date_column_before))
+```
+
+```{r}
+## Function to find the most recent ELO for a team on a given date
+find_ELO_for_team_and_date <- function(team, date_column) {
+  # Filter Country_Data for the given team
+  team_data = filter(Country_Data, country_full == team)
+  # Extract the ELO value from the column corresponding to the latest_date_column
+  elo_value = team_data[[date_column]]
+  
+  return(elo_value)
+}
+```
+
+```{r}
+## Creating home_ELO and away_ELO columns in WC_dataset
+WC_dataset <- WC_dataset %>%
+  rowwise() %>%
+  mutate(
+    # Adding home_ELO
+    home_ELO = find_ELO_for_team_and_date(home_team, latest_ranking_date),
+    # Adding away_ELO
+    away_ELO = find_ELO_for_team_and_date(away_team, latest_ranking_date)
+  ) %>%
+  ungroup()
+```
+
+```{r}
+# Remove games where either home or away ELO is null indicating there is no ranking for the team at the time played
+WC_dataset = filter(WC_dataset, home_ELO != 'NULL' &
+                      away_ELO != 'NULL')
+```
+
+```{r} 
+## Used to help clean data
+# Filter rows where home_confederation or away_confederation is NA
+null_confederation_games = filter(WC_dataset,
+                                  is.na(home_confederation) | is.na(away_confederation))
+
+# Filter rows where either home_ELO or away_ELO is NA
+games_with_null_ELO = filter(WC_dataset, home_ELO == 'NULL' |
+                               away_ELO == 'NULL')
+
+# If there exists a game with null ELO or null confederation ...
+if (nrow(games_with_null_ELO) > 0 ||
+    nrow(null_confederation_games) > 0) {
+  # Print the games with null_confederation
+  print(null_confederation_games)
+  # Print the games with null_ELO
+  print(games_with_null_ELO)
+}
+```
+
+```{r}
+## Creates comparison metrics to use in regression as well as an outcome metric and adds as columns to WC_dataset
+WC_dataset <- WC_dataset %>%
+  rowwise() %>%
+  mutate(
+    # Finds the difference in ELO between the two teams
+    ELO_difference = home_ELO - away_ELO,
+    # Finds the ratio of the ELO between the two teams
+    ELO_ratio = home_ELO / away_ELO,
+    # Goal Differential from home team's perspective
+    home_GD = home_score - away_score,
+    # Outcome from home team's perspective, 1 for win, 0 for draw, -1 for loss
+    home_result = ifelse(home_score > away_score, 1,
+                         ifelse(away_score > home_score,-1, 0))
+  ) %>%
+  ungroup()
+```
+
+```{r}
+## Create six different models to compare using difference vs ratio as well as including confederations or not
+# Compares with ELO_difference, excludes confederation
+dif_model = multinom(home_result ~ ELO_difference, data = WC_dataset)
+
+# Compares with ELO_ratio, excludes confederation
+rat_model = multinom(home_result ~ ELO_ratio, data = WC_dataset)
+
+# Compares with ELO_difference and ELO_ratio, excludes confederation
+dif_rat_model = multinom(home_result ~ ELO_difference + ELO_ratio, data = WC_dataset)
+
+# Compares with ELO_difference, includes confederation
+confed_dif_model = multinom(home_result ~ ELO_difference + home_confederation + away_confederation,
+                            data = WC_dataset)
+
+# Compares with ELO_ratio, includes confederation
+confed_rat_model = multinom(home_result ~ ELO_ratio + home_confederation + away_confederation,
+                            data = WC_dataset)
+
+# Compares with ELO_difference and ELO_ratio, includes confederation
+confed_dif_rat_model = multinom(
+  home_result ~ ELO_difference + ELO_ratio + home_confederation + away_confederation,
+  data = WC_dataset
+)
+
+```
+
+```{r}
+
+## Takes in all the deviances and plots them
+# Load necessary library
+library(ggplot2)
+
+# Takes in all the deviances and adds them to a list
+Residual_Deviance <- c(
+  deviance(dif_model),
+  deviance(rat_model),
+  deviance(dif_rat_model),
+  deviance(confed_dif_model),
+  deviance(confed_rat_model),
+  deviance(confed_dif_rat_model)
+)
+# Names the models
+Model <- c('ELO_D',
+           'ELO_R',
+           'ELO_DR',
+           'C_ELO_D',
+           'C_ELO_R',
+           'C_ELO_DR')
+
+# Create a data frame from the vectors
+data <- data.frame(Model, Residual_Deviance)
+
+# Adjust Model factor levels to reflect the order of Residual_Deviance
+data$Model <- factor(data$Model, levels = data$Model[order(data$Residual_Deviance)])
+
+# Plot the Residual Deviance by model using the sorted data
+ggplot(data, aes(x = reorder(Model, Residual_Deviance), y = Residual_Deviance, fill = Model)) +
+  geom_bar(stat = "identity") +
+  coord_flip() + # Flipping the coordinates to have horizontal bars
+  labs(title = "Residual Deviance by Model",
+       x = "Model",
+       y = "Residual Deviance") +
+  theme_minimal() +
+  scale_fill_brewer(palette = "Spectral") +
+  coord_cartesian(ylim = c(6000, 8000)) # Optional: Adjust based on your specific data range
+```
+
+```{r}
+## Runs three likelihood ratio tests to see if including confederation is a stastically significant inclusion
+# LRT test for models using ELO_difference
+lrt_dif_result = lrtest(dif_model, confed_dif_model)
+# LRT test for models using ELO_ratio
+lrt_rat_result = lrtest(rat_model, confed_rat_model)
+# LRT test for models using both ELO_difference and ELO_ratio
+lrt_dif_rat_result = lrtest(dif_rat_model, confed_dif_rat_model)
+
+# Prints results
+print(lrt_dif_result)
+print(lrt_rat_result)
+print(lrt_dif_rat_result)
+```
+# As we can see from the lower standard errors, residual deviance, and AIC, the difference model seems to be more effective at predicting outcomes. Additionally, as shown by the statistically significant LRTs, including the confederation seems to make the predictions more accuracte meaning our confed_dif_model is the best predictor. This is interesting to note and we will continue to try and prove this later.
+
+# Now we need to test our 6 models
+# To do this we must first use the models to calculate the probabilities of a win, draw, or loss
+# We must then use these probabilities to predict single games
+# We must then use the single games to predict the group stage
+# We must then use the group stage to generate a bracket
+# We must then compare our generated bracket to the actual bracket
+# We must then repeat 10000 times
+```{r}
+## Create a function that generates the probabilities of a Win, Draw, and Loss using our model and its inputs
+W_D_L_probabilities <-
+  function(model,
+           ELO_difference,
+           ELO_ratio,
+           home_confederation,
+           away_confederation) {
+    # Start by creating a data frame with the ELO_difference and ELO_ratio
+    match_data <-
+      data.frame(ELO_difference = ELO_difference, ELO_ratio = ELO_ratio)
+    # Conditionally add confederation data if it's not NULL
+    if (!is.null(home_confederation) &&
+        !is.null(away_confederation))  {
+      match_data$home_confederation <- home_confederation
+      match_data$away_confederation <- away_confederation
+    }
+    # Use the model to generate probabilities
+    predictions <- predict(model, match_data, type = "probs")
+    return(predictions)
+  }
+```
+
+```{r}
+## Create a function that uses W_D_L probabilities to give a definitive outcome using our model and its inputs
+simulate_single_game <-
+  function(model,
+           ELO_difference,
+           ELO_ratio,
+           home_confederation,
+           away_confederation) {
+    # Get probabilities for Win, Draw, and Loss
+    probabilities <-
+      W_D_L_probabilities(model,
+                          ELO_difference,
+                          ELO_ratio,
+                          home_confederation,
+                          away_confederation)
+    
+    # Randomly generate a number between 0 and 1
+    random_number <- runif(1)
+    
+    # Define the cumulative probabilities for selecting the outcome
+    cumulative_prob <- cumsum(probabilities)
+    
+    # Determine the outcome based on the random number and cumulative probabilities
+    if (random_number <= cumulative_prob["-1"]) {
+      # Home loss
+      outcome <- -1
+    } else if (random_number <= cumulative_prob["0"]) {
+      # Home draw
+      outcome <- 0
+    } else {
+      # Home win
+      outcome <- 1
+    }
+    
+    return(outcome)
+  }
+```
+
+```{r}
+## Create a function that takes in our WC Group Stage, predicts every single game, and returns each team's rank in their group
+simulate_group_stage <- function(model, teams) {
+  # Initialize a vector to keep track of points for each team
+  teams$Points <- 0
+  
+  # Split the dataframe by group
+  groups <- split(teams, teams$Group)
+  
+  # Iterate through each group
+  for (group_name in names(groups)) {
+    group <- groups[[group_name]]
+    
+    # Simulate each team playing every other team once within the group
+    for (i in 1:(nrow(group) - 1)) {
+      for (j in (i + 1):nrow(group)) {
+        # Use predict_single_game to get the outcome of the game and save it in home_result
+        home_result <-
+          simulate_single_game(
+            model,
+            ELO_difference = group$ELO[i] - group$ELO[j],
+            ELO_ratio = group$ELO[i] / group$ELO[j],
+            home_confederation = group$Confederation[i],
+            away_confederation = group$Confederation[j]
+          )
+        # Update points based on match outcome
+        if (home_result == 1) {
+          # Home win
+          group$Points[i] <- group$Points[i] + 3
+        } else if (home_result == 0) {
+          # Home draw
+          group$Points[i] <- group$Points[i] + 1
+          group$Points[j] <- group$Points[j] + 1
+        } else {
+          # Home loss
+          group$Points[j] <- group$Points[j] + 3
+        }
+      }
+    }
+    # Update the points in the main dataframe
+    teams$Points[teams$Group == group_name] <- group$Points
+  }
+  
+  # Rank teams within their groups, break ties randomly
+  teams$rank <-
+    ave(
+      teams$Points,
+      teams$Group,
+      FUN = function(x)
+        rank(-x, ties.method = "random")
+    )
+  
+  return(teams)
+}
+```
+
+```{r}
+## Create a function that takes in the results of our simulated group stage and returns a bracket in 1A2B, 1C2D, ... format
+create_bracket <- function(Group_Stage) {
+  # Filter the eight group winners
+  winners = filter(Group_Stage, rank == "1")
+  # Filter the eight group runners up
+  runners_up = filter(Group_Stage, rank == "2")
+  # Define the specific order of matchups as per the World Cup regulations
+  matchups_order <-
+    c("1A2B", "1C2D", "1E2F", "1G2H", "1B2A", "1D2C", "1F2E", "1H2G")
+  
+  # Initialize an empty dataframe to store the matchups
+  matchups <-
+    data.frame(Team1 = character(),
+               Team2 = character(),
+               stringsAsFactors = FALSE)
+  
+  # Loop through the matchups_order to create matchups
+  for (matchup in matchups_order) {
+    # Extract the groups for the winner and runner-up in the matchup
+    group_winner <- substr(matchup, 2, 2)
+    group_runner_up <- substr(matchup, 4, 4)
+    
+    # Find the corresponding teams
+    winner <- winners[winners$Group == group_winner, , drop = FALSE]
+    runner_up <-
+      runners_up[runners_up$Group == group_runner_up, , drop = FALSE]
+    
+    # Append to the matchups dataframe, retaining additional information
+    matchup_info <- data.frame(
+      Team1 = winner$Team,
+      Team2 = runner_up$Team,
+      Team1_ELO = winner$ELO,
+      Team2_ELO = runner_up$ELO,
+      Team1_Confederation = winner$Confederation,
+      Team2_Confederation = runner_up$Confederation,
+      stringsAsFactors = FALSE
+    )
+    
+    matchups <- rbind(matchups, matchup_info)
+  }
+  # matchups now contains the desired matchups along with additional info
+  return(matchups)
+}
+```
+
+```{r}
+## Create a function that uses W_D_L probabilities to give a definitive outcome without draws using our model and its inputs
+simulate_single_game_knockout <- function(model, matchup) {
+  # Get probabilities for Win, Draw, and Loss
+  probabilities <-
+    W_D_L_probabilities(
+      model,
+      matchup$Team1_ELO - matchup$Team2_ELO,
+      matchup$Team1_ELO / matchup$Team2_ELO,
+      matchup$Team1_Confederation,
+      matchup$Team2_Confederation
+    )
+  # Randomly generate a number between 0 and 1
+  random_number <- runif(1)
+  
+  # Define the cumulative probabilities for selecting the outcome
+  cumulative_prob <- cumsum(probabilities)
+  # Determine the outcome based on the random number and cumulative probabilities
+  if (random_number <= cumulative_prob["-1"]) {
+    # Home loss
+    outcome <- 2
+  } else if (random_number > cumulative_prob["0"]) {
+    # Home win
+    outcome <- 1
+  } else {
+    # Extra Time
+    
+    # Randomly generate another number between 0 and 1 for ET
+    ET_random_number <- runif(1)
+    if (ET_random_number <= cumulative_prob["-1"]) {
+      # Home loss
+      outcome <- 2
+    } else if (ET_random_number > cumulative_prob["0"]) {
+      # Home win
+      outcome <- 1
+    } else {
+      # Penalties 
+      
+      # Randomly selects a winner in penalties
+      outcome <- sample(c(1,2), size = 1)
+    }
+  }
+  return(outcome)
+}
+```
+
+```{r}
+## Create a function to simulate the outcome of an inputted bracket using our model and returning champion, runner up, and total teams correctly predicted
+simulate_bracket <- function(model, bracket) {
+  # Initializes our total_correct tracker
+  Overall_correct = 0
+  # This simulates a bracket
+  current_round <- bracket
+  # Initializes a variable for the round we are in correlated to the column # of that round in our dataset
+  round = 5
+  next_round <-
+    data.frame(Team1 = character(),
+               Team2 = character(),
+               stringsAsFactors = FALSE)
+  # As long as the current_round is not the final
+  while (round < 8) {
+    # Clear the next round
+    next_round <- next_round[0, ]
+    # Seperates every two matchups together
+    for (i in seq(1, nrow(current_round), by = 2)) {
+      team_1 = as.character(current_round[i, 1])
+      team_2 = as.character(current_round[i, 2])
+      team_3 = as.character(current_round[i + 1, 1])
+      team_4 = as.character(current_round[i + 1, 2])
+      # Puts the 4 teams that could play each other in the next round in one list
+      teams = c(team_1, team_2, team_3, team_4)
+      for (team in teams) {
+        # Adds 1 to overall correct if these teams made the current_round of the tournament
+        if (Test_WC_2022_dataset[Test_WC_2022_dataset$Team == team, round] == 1) {
+          Overall_correct = Overall_correct + 1
+        }
+      }
+      # Simulate these two matches to get the winners for the next round
+      team_name = as.character(current_round[i, 1])
+      game1 <-
+        simulate_single_game_knockout(model,
+                                      current_round[i, , drop = FALSE])
+      game2 <- simulate_single_game_knockout(model,
+                                             current_round[i + 1, , drop = FALSE])
+      # Prepare the matchup for the next round
+      next_round <-
+        rbind(
+          next_round,
+          data.frame(
+            Team1 = current_round[i, game1],
+            Team2 = current_round[i + 1, game2],
+            Team1_ELO = current_round[i, game1 + 2],
+            Team2_ELO = current_round[i + 1, game2 + 2],
+            Team1_Confederation = current_round[i, game1 + 4],
+            Team2_Confederation = current_round[i + 1, game2 + 4]
+          )
+        )
+    }
+    # Prepare the next round
+    current_round <- next_round
+    round = round + 1
+  }
+  # The final match to determine the champion
+  Winner_Final <-
+    simulate_single_game_knockout(model, current_round)
+  # Figures out who was champion
+  champion <-
+    ifelse(Winner_Final == 1, current_round$Team1, current_round$Team2)
+  # Figures out who was runner up
+  runner_up <-
+    ifelse(Winner_Final == 1, current_round$Team2, current_round$Team1)
+  # Adds champion and runner_up to total correct count if correct
+  if (Test_WC_2022_dataset[Test_WC_2022_dataset$Team == champion, 8] == 1) {
+    Overall_correct = Overall_correct + 1
+  }
+  if (Test_WC_2022_dataset[Test_WC_2022_dataset$Team == runner_up, 8] == 1) {
+    Overall_correct = Overall_correct + 1
+  }
+  if (Test_WC_2022_dataset[Test_WC_2022_dataset$Team == champion, 9] == 1) {
+    Overall_correct = Overall_correct + 1
+  }
+  
+  #returns champion, runner up, and overall correct in a list
+  return(list(champion, runner_up, Overall_correct))
+}
+```
+
+```{r}
+## Create a function to simulate a World Cup from start to end
+simulate_world_cup <- function(model, teams) {
+  # Simulates group stage
+  group_stage = simulate_group_stage(model, teams)
+  # Converts group stage into bracket
+  bracket = create_bracket(group_stage)
+  # Simulates the bracket
+  results = simulate_bracket(model, bracket)
+  return(results)
+}
+```
+
+```{r}
+## Create a function to simulate the World Cup 1000 times using a list of teams for the group stage
+simulate_1000_world_cups <- function(model, teams) {
+  # Initializes a variable with the total times the correct champion is picked across the 1000 simulations
+  Correct_champion = 0
+  # Initializes a variable with the total times the correct final matchup is picked across the 1000 simulations
+  Correct_final = 0
+  # Initializes a variable with the total times a winner is correctly picked across the 1000 simulations
+  Overall_correct = 0
+  # Number of simulations
+  nsimulations = 1000
+  # Initializes a variable with the number of games picked right by the best bracket picked across the 1000 simulations
+  Max_correct = 0
+  for (i in 1:nsimulations) {
+    # Simulate 1 world cup
+    results = simulate_world_cup(model, teams)
+    if (results[1] == "Argentina") {
+      # Increases correct_champion by 1 if Argentina was the simulated champion
+      Correct_champion = Correct_champion + 1
+    }
+    if ((results[1] == "Argentina" && results[2] == "France") ||
+        (results[1] == "France" && results[2] == "Argentina")) {
+      # Increases correct_final by 1 if Argentina-France was the simulated final
+      Correct_final = Correct_final + 1
+    }
+    # Increases overall_correct by the total number of games predicted in this simulation
+    Overall_correct = Overall_correct + as.numeric(results[3])
+    if (as.numeric(results[3]) > Max_correct) {
+      # Resets Max_correct if this was the best_bracket so far
+      Max_correct = as.numeric(results[3])
+    }
+  }
+  # Calculates the average games correctly predicted across all 1000 simulations
+  Average_correct = Overall_correct / nsimulations
+  return(list(
+    Correct_champion,
+    Correct_final,
+    Average_correct,
+    Max_correct
+  ))
+}
+```
+
+```{r}
+## Runs 1000 simulations for each of the 6 models
+dif_accuracy = simulate_1000_world_cups(dif_model, Test_WC_2022_dataset)
+rat_accuracy = simulate_1000_world_cups(rat_model, Test_WC_2022_dataset)
+dif_rat_accuracy = simulate_1000_world_cups(dif_rat_model, Test_WC_2022_dataset)
+confed_dif_accuracy = simulate_1000_world_cups(confed_dif_model, Test_WC_2022_dataset)
+confed_rat_accuracy = simulate_1000_world_cups(confed_rat_model, Test_WC_2022_dataset)
+confed_dif_rat_accuracy = simulate_1000_world_cups(confed_dif_rat_model, Test_WC_2022_dataset)
+```
+
+
+```{r}
+## Put results into a dataframe
+results <- data.frame(
+  Model = c('ELO_D',
+            'ELO_R',
+            'ELO_DR',
+            'C_ELO_D',
+            'C_ELO_R',
+            'C_ELO_DR'),
+  Correct_Champion = c(
+    dif_accuracy[[1]],
+    rat_accuracy[[1]],
+    dif_rat_accuracy[[1]],
+    confed_dif_accuracy[[1]],
+    confed_rat_accuracy[[1]],
+    confed_dif_rat_accuracy[[1]]
+  ),
+  Correct_Finalists = c(
+    dif_accuracy[[2]],
+    rat_accuracy[[2]],
+    dif_rat_accuracy[[2]],
+    confed_dif_accuracy[[2]],
+    confed_rat_accuracy[[2]],
+    confed_dif_rat_accuracy[[2]]
+  ),
+  Average_Correct = c(
+    dif_accuracy[[3]],
+    rat_accuracy[[3]],
+    dif_rat_accuracy[[3]],
+    confed_dif_accuracy[[3]],
+    confed_rat_accuracy[[3]],
+    confed_dif_rat_accuracy[[3]]
+  ),
+  Max_Correct = c(
+    dif_accuracy[[4]],
+    rat_accuracy[[4]],
+    dif_rat_accuracy[[4]],
+    confed_dif_accuracy[[4]],
+    confed_rat_accuracy[[4]],
+    confed_dif_rat_accuracy[[4]]
+  )
+)
+```
+
+```{r}
+## Run various plots for statistical analysis
+
+# Plot Correct_Champion results
+ggplot(results, aes(x = Model, y = Correct_Champion, fill = Model)) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  labs(title = "Correct Champion Predictions by Model",
+       y = "Number of Correct Predictions",
+       x = "Model")
+
+# Plot Correct_Finalists results
+ggplot(results, aes(x = Model, y = Correct_Finalists, fill = Model)) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  labs(title = "Correct Final Predictions by Model",
+       y = "Number of Correct Predictions",
+       x = "Model")
+
+# Plot Average_Correct results
+ggplot(results, aes(x = Model, y = Average_Correct, fill = Model)) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  labs(title = "Average Correct Predictions by Model",
+       y = "Average Correct Predictions Per Tournqment by Model (out of 31)",
+       x = "Model") + coord_cartesian(ylim = c(12, 15))
+
+# Plot Correct_Champion results
+ggplot(results, aes(x = Model, y = Max_Correct, fill = Model)) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  labs(title = "Number of Predictions Correct in the Most Accurate Bracket by Model",
+       y = "Number of Correct Predictions",
+       x = "Model")
+
+
+# Sort Source Data by tournament only including those with over 250 games played
+tournament_counts <- games %>%
+  group_by(tournament) %>%
+  summarise(count = n()) %>%
+  filter(count > 250) # Keep only those tournaments with more than 100 occurrences
+# Plot the data
+ggplot(tournament_counts, aes(x = reorder(tournament, count), y = count)) +
+  geom_bar(stat = "identity") + # Use geom_col() as an alternative
+  theme_minimal() +
+  labs(title = "Tournament Appearance Counts",
+       x = "Tournament",
+       y = "Count (min 250)") +
+  coord_flip()
+```
